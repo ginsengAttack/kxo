@@ -6,6 +6,7 @@
 #include <string.h>
 #include <sys/select.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "game.h"
@@ -13,6 +14,33 @@
 #define XO_STATUS_FILE "/sys/module/kxo/initstate"
 #define XO_DEVICE_FILE "/dev/kxo"
 #define XO_DEVICE_ATTR_FILE "/sys/class/kxo/kxo/kxo_state"
+
+static char table[N_GRIDS];
+// static char draw;
+
+// static int table_initial() {}
+
+static int draw_board(char *table)
+{
+    int k = 0;
+    printf("\n");
+    printf("\n");
+
+    for (int row = 0; row < BOARD_SIZE; row++) {
+        for (int j = 0; j < (BOARD_SIZE << 1) - 1 && k < N_GRIDS; j++) {
+            char draw = j & 1 ? '|' : table[k++];
+            if (!draw)
+                draw = ' ';
+            printf("%c", draw);
+        }
+        printf("\n");
+        for (int j = 0; j < (BOARD_SIZE << 1) - 1; j++) {
+            printf("-");
+        }
+        printf("\n");
+    }
+    return 0;
+}
 
 static bool status_check(void)
 {
@@ -90,7 +118,8 @@ int main(int argc, char *argv[])
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
     fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
 
-    char display_buf[DRAWBUFFER_SIZE];
+    // char display_buf[DRAWBUFFER_SIZE];
+    char step[5];
 
     fd_set readset;
     int device_fd = open(XO_DEVICE_FILE, O_RDONLY);
@@ -113,10 +142,21 @@ int main(int argc, char *argv[])
             FD_CLR(STDIN_FILENO, &readset);
             listen_keyboard_handler();
         } else if (read_attr && FD_ISSET(device_fd, &readset)) {
+            step[4] = '\0';
             FD_CLR(device_fd, &readset);
+
+            read(device_fd, step, 4);
             printf("\033[H\033[J"); /* ASCII escape code to clear the screen */
-            read(device_fd, display_buf, DRAWBUFFER_SIZE);
-            printf("%s", display_buf);
+            table[step[1] - '0'] = step[0];
+            draw_board(table);
+
+            if (step[2] == 'W') {
+                printf("%c win!!!\n", step[0]);
+                memset(table, ' ',
+                       N_GRIDS); /* Reset the table so the game restart */
+                read(device_fd, step, 4);
+                memset(step, ' ', 4); /* Reset the table so the game restart */
+            }
         }
     }
 

@@ -8,6 +8,7 @@
 #include <linux/slab.h>
 #include <linux/sysfs.h>
 #include <linux/version.h>
+#include <linux/vmalloc.h>
 #include <linux/workqueue.h>
 
 #include "game.h"
@@ -29,7 +30,7 @@ MODULE_DESCRIPTION("In-kernel Tic-Tac-Toe game engine");
 
 #define NR_KMLDRV 1
 
-static int delay = 100; /* time (in ms) to generate an event */
+static int delay = 1000; /* time (in ms) to generate an event */
 
 /* Declare kernel module attribute for sysfs */
 
@@ -77,7 +78,7 @@ static int major;
 static struct class *kxo_class;
 static struct cdev kxo_cdev;
 
-static char draw_buffer[DRAWBUFFER_SIZE];
+static char move_step[4];
 
 /* Data are stored into a kfifo buffer before passing them to the userspace */
 static DECLARE_KFIFO_PTR(rx_fifo, unsigned char);
@@ -94,9 +95,9 @@ static DECLARE_WAIT_QUEUE_HEAD(rx_wait);
 /* Insert the whole chess board into the kfifo buffer */
 static void produce_board(void)
 {
-    unsigned int len = kfifo_in(&rx_fifo, draw_buffer, sizeof(draw_buffer));
-    if (unlikely(len < sizeof(draw_buffer)) && printk_ratelimit())
-        pr_warn("%s: %zu bytes dropped\n", __func__, sizeof(draw_buffer) - len);
+    unsigned int len = kfifo_in(&rx_fifo, move_step, sizeof(move_step));
+    if (unlikely(len < sizeof(move_step)) && printk_ratelimit())
+        pr_warn("%s: %zu bytes dropped\n", __func__, sizeof(move_step) - len);
 
     pr_debug("kxo: %s: in %u/%u bytes\n", __func__, len, kfifo_len(&rx_fifo));
 }
@@ -115,34 +116,6 @@ static DEFINE_MUTEX(consumer_lock);
 static struct circ_buf fast_buf;
 
 static char table[N_GRIDS];
-
-/* Draw the board into draw_buffer */
-static int draw_board(char *table)
-{
-    int i = 0, k = 0;
-    draw_buffer[i++] = '\n';
-    smp_wmb();
-    draw_buffer[i++] = '\n';
-    smp_wmb();
-
-    while (i < DRAWBUFFER_SIZE) {
-        for (int j = 0; j < (BOARD_SIZE << 1) - 1 && k < N_GRIDS; j++) {
-            draw_buffer[i++] = j & 1 ? '|' : table[k++];
-            smp_wmb();
-        }
-        draw_buffer[i++] = '\n';
-        smp_wmb();
-        for (int j = 0; j < (BOARD_SIZE << 1) - 1; j++) {
-            draw_buffer[i++] = '-';
-            smp_wmb();
-        }
-        draw_buffer[i++] = '\n';
-        smp_wmb();
-    }
-
-
-    return 0;
-}
 
 /* Clear all data from the circular buffer fast_buf */
 static void fast_buf_clear(void)
@@ -175,9 +148,9 @@ static void drawboard_work_func(struct work_struct *w)
     }
     read_unlock(&attr_obj.lock);
 
-    mutex_lock(&producer_lock);
-    draw_board(table);
-    mutex_unlock(&producer_lock);
+    // mutex_lock(&producer_lock);
+    // draw_board(table);
+    // mutex_unlock(&producer_lock);
 
     /* Store data to the kfifo buffer */
     mutex_lock(&consumer_lock);
@@ -211,6 +184,14 @@ static void ai_one_work_func(struct work_struct *w)
 
     if (move != -1)
         WRITE_ONCE(table[move], 'O');
+    move_step[0] = 'O';
+    smp_wmb();
+    move_step[1] = move + '0';
+    smp_wmb();
+    move_step[2] = 'N';
+    smp_wmb();
+    move_step[3] = '\n';
+    smp_wmb();
 
     WRITE_ONCE(turn, 'X');
     WRITE_ONCE(finish, 1);
@@ -245,6 +226,14 @@ static void ai_two_work_func(struct work_struct *w)
 
     if (move != -1)
         WRITE_ONCE(table[move], 'X');
+    move_step[0] = 'X';
+    smp_wmb();
+    move_step[1] = move + '0';
+    smp_wmb();
+    move_step[2] = 'N';
+    smp_wmb();
+    move_step[3] = '\n';
+    smp_wmb();
 
     WRITE_ONCE(turn, 'O');
     WRITE_ONCE(finish, 1);
@@ -347,7 +336,10 @@ static void timer_handler(struct timer_list *__timer)
             put_cpu();
 
             mutex_lock(&producer_lock);
-            draw_board(table);
+            move_step[2] = 'W';
+            smp_wmb();
+            move_step[3] = '\n';
+            smp_wmb();
             mutex_unlock(&producer_lock);
 
             /* Store data to the kfifo buffer */
