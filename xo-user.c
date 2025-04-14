@@ -129,16 +129,6 @@ static void task1(void)
     if (setjmp(tasklist[0]->env) == 0)
         longjmp(schedule_buf, 1);
 
-    FD_ZERO(&readset);
-    FD_SET(STDIN_FILENO, &readset);
-    FD_SET(device_fd, &readset);
-
-    int result = select(max_fd + 1, &readset, NULL, NULL, NULL);
-    if (result < 0) {
-        printf("Error with select system call\n");
-        exit(1);
-    }
-
     char step[5];
 
     if (read_attr && FD_ISSET(device_fd, &readset)) {
@@ -195,6 +185,19 @@ static void initial_tasklist(void)
     tasklist[1] = task_2;
     tasklist[2] = key_board;
 }
+/*open file and use select to listen the file*/
+static void file_listen(void)
+{
+    FD_ZERO(&readset);
+    FD_SET(STDIN_FILENO, &readset);
+    FD_SET(device_fd, &readset);
+
+    int result = select(max_fd + 1, &readset, NULL, NULL, NULL);
+    if (result < 0) {
+        printf("Error with select system call\n");
+        exit(1);
+    }
+}
 
 /*the function to switch task*/
 static void switch_task()
@@ -225,6 +228,7 @@ static void schedule(void)
     if (end_attr)
         return;
 
+    file_listen();
     current++;
     switch_task();
 }
