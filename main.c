@@ -76,21 +76,25 @@ static struct timer_list timer;
 /* Character device stuff */
 static int major;
 static struct class *kxo_class;
-static struct cdev kxo_cdev;
+static struct cdev kxo_cdev, kxo_cdev2;
 
 static char move_step[4];
 
+
 /* Data are stored into a kfifo buffer before passing them to the userspace */
 static DECLARE_KFIFO_PTR(rx_fifo, unsigned char);
+static DECLARE_KFIFO_PTR(rx_fifo2, unsigned char);
 
 /* NOTE: the usage of kfifo is safe (no need for extra locking), until there is
  * only one concurrent reader and one concurrent writer. Writes are serialized
  * from the interrupt context, readers are serialized using this mutex.
  */
 static DEFINE_MUTEX(read_lock);
+static DEFINE_MUTEX(read_lock2);
 
 /* Wait queue to implement blocking I/O from userspace */
 static DECLARE_WAIT_QUEUE_HEAD(rx_wait);
+static DECLARE_WAIT_QUEUE_HEAD(rx_wait2);
 
 /* Insert the whole chess board into the kfifo buffer */
 static void produce_board(void)
@@ -103,12 +107,12 @@ static void produce_board(void)
 }
 
 /* Mutex to serialize kfifo writers within the workqueue handler */
-static DEFINE_MUTEX(producer_lock);
+static DEFINE_MUTEX(producer_lock);  // will deleted
 
 /* Mutex to serialize fast_buf consumers: we can use a mutex because consumers
  * run in workqueue handler (kernel thread context).
  */
-static DEFINE_MUTEX(consumer_lock);
+static DEFINE_MUTEX(consumer_lock);  // will deleted
 
 /* We use an additional "faster" circular buffer to quickly store data from
  * interrupt context, before adding them to the kfifo.
@@ -200,6 +204,7 @@ static void ai_one_work_func(struct work_struct *w)
     tv_end = ktime_get();
 
     nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
+
     pr_info("kxo: [CPU#%d] doing %s for %llu usec\n", cpu, __func__,
             (unsigned long long) nsecs >> 10);
     put_cpu();
@@ -246,16 +251,36 @@ static void ai_two_work_func(struct work_struct *w)
             (unsigned long long) nsecs >> 10);
     put_cpu();
 }
+/*use coroutine to package ai_1、ai_2 and drawboard in one work item
+ *and tasklet can just put one item into work queue
+ */
 
+static void entire_game_func(struct work_struct *w)
+{
+    READ_ONCE(finish);
+    READ_ONCE(turn);
+    smp_rmb();
+    if (finish && turn == 'O') {
+        WRITE_ONCE(finish, 0);
+        smp_wmb();
+        ai_one_work_func(w);
+    } else if (finish && turn == 'X') {
+        WRITE_ONCE(finish, 0);
+        smp_wmb();
+        ai_two_work_func(w);
+    }
+    drawboard_work_func(w);
+}
 /* Workqueue for asynchronous bottom-half processing */
 static struct workqueue_struct *kxo_workqueue;
 
 /* Work item: holds a pointer to the function that is going to be executed
  * asynchronously.
  */
-static DECLARE_WORK(drawboard_work, drawboard_work_func);
-static DECLARE_WORK(ai_one_work, ai_one_work_func);
-static DECLARE_WORK(ai_two_work, ai_two_work_func);
+// static DECLARE_WORK(drawboard_work, drawboard_work_func);
+// static DECLARE_WORK(ai_one_work, ai_one_work_func);
+// static DECLARE_WORK(ai_two_work, ai_two_work_func);
+static DECLARE_WORK(entire_game, entire_game_func);
 
 /* Tasklet handler.
  *
@@ -273,20 +298,8 @@ static void game_tasklet_func(unsigned long __data)
 
     tv_start = ktime_get();
 
-    READ_ONCE(finish);
-    READ_ONCE(turn);
-    smp_rmb();
+    queue_work(kxo_workqueue, &entire_game);
 
-    if (finish && turn == 'O') {
-        WRITE_ONCE(finish, 0);
-        smp_wmb();
-        queue_work(kxo_workqueue, &ai_one_work);
-    } else if (finish && turn == 'X') {
-        WRITE_ONCE(finish, 0);
-        smp_wmb();
-        queue_work(kxo_workqueue, &ai_two_work);
-    }
-    queue_work(kxo_workqueue, &drawboard_work);
     tv_end = ktime_get();
 
     nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
@@ -348,6 +361,11 @@ static void timer_handler(struct timer_list *__timer)
             mutex_unlock(&consumer_lock);
 
             wake_up_interruptible(&rx_wait);
+
+            char tmp[5] = "game2";
+            kfifo_in(&rx_fifo2, tmp, sizeof(tmp));
+            pr_info("kxo:!!!!!!!!!!!!!!%s\n", tmp);
+            wake_up_interruptible(&rx_wait2);
         }
 
         if (attr_obj.end == '0') {
@@ -438,6 +456,44 @@ static const struct file_operations kxo_fops = {
     .owner = THIS_MODULE,
 };
 
+static ssize_t kxo_read2(struct file *file,
+                         char __user *buf,
+                         size_t count,
+                         loff_t *ppos)
+{
+    unsigned int read;
+    int ret;
+
+    if (unlikely(!access_ok(buf, count)))
+        return -EFAULT;
+
+    if (mutex_lock_interruptible(&read_lock2))
+        return -ERESTARTSYS;
+
+    do {
+        ret = kfifo_to_user(&rx_fifo2, buf, count, &read);
+        if (unlikely(ret < 0))
+            break;
+        if (read)
+            break;
+        if (file->f_flags & O_NONBLOCK) {
+            ret = -EAGAIN;
+            break;
+        }
+        ret = wait_event_interruptible(rx_wait2, kfifo_len(&rx_fifo2));
+    } while (ret == 0);
+    mutex_unlock(&read_lock2);
+
+    return ret ? ret : read;
+}
+static const struct file_operations kxo_fops2 = {
+    .read = kxo_read2,
+    .llseek = no_llseek,
+    .open = no_llseek,
+    .release = no_llseek,
+    .owner = THIS_MODULE,
+};
+
 static int __init kxo_init(void)
 {
     dev_t dev_id;
@@ -446,17 +502,26 @@ static int __init kxo_init(void)
     if (kfifo_alloc(&rx_fifo, PAGE_SIZE, GFP_KERNEL) < 0)
         return -ENOMEM;
 
+    if (kfifo_alloc(&rx_fifo2, PAGE_SIZE, GFP_KERNEL) < 0)
+        return -ENOMEM;
+
     /* Register major/minor numbers */
-    ret = alloc_chrdev_region(&dev_id, 0, NR_KMLDRV, DEV_NAME);
+    ret = alloc_chrdev_region(&dev_id, 0, 2, DEV_NAME);
     if (ret)
         goto error_alloc;
     major = MAJOR(dev_id);
 
     /* Add the character device to the system */
     cdev_init(&kxo_cdev, &kxo_fops);
-    ret = cdev_add(&kxo_cdev, dev_id, NR_KMLDRV);
+    ret = cdev_add(&kxo_cdev, MKDEV(major, 0), NR_KMLDRV);
     if (ret) {
         kobject_put(&kxo_cdev.kobj);
+        goto error_region;
+    }
+    cdev_init(&kxo_cdev2, &kxo_fops2);
+    ret = cdev_add(&kxo_cdev2, MKDEV(major, 1), NR_KMLDRV);
+    if (ret) {
+        kobject_put(&kxo_cdev2.kobj);
         goto error_region;
     }
 
@@ -475,6 +540,7 @@ static int __init kxo_init(void)
     /* Register the device with sysfs */
     struct device *kxo_dev =
         device_create(kxo_class, NULL, MKDEV(major, 0), NULL, DEV_NAME);
+    device_create(kxo_class, NULL, MKDEV(major, 1), NULL, "kxo2");
 
     ret = device_create_file(kxo_dev, &dev_attr_kxo_state);
     if (ret < 0) {
@@ -521,15 +587,17 @@ out:
 error_cdev:
     cdev_del(&kxo_cdev);
 error_region:
-    unregister_chrdev_region(dev_id, NR_KMLDRV);
+    unregister_chrdev_region(dev_id, 2);
 error_alloc:
     kfifo_free(&rx_fifo);
+    kfifo_free(&rx_fifo2);
     goto out;
 }
 
 static void __exit kxo_exit(void)
 {
     dev_t dev_id = MKDEV(major, 0);
+    dev_t dev_id2 = MKDEV(major, 1);
 
     del_timer_sync(&timer);
     tasklet_kill(&game_tasklet);
@@ -537,11 +605,14 @@ static void __exit kxo_exit(void)
     destroy_workqueue(kxo_workqueue);
     vfree(fast_buf.buf);
     device_destroy(kxo_class, dev_id);
+    device_destroy(kxo_class, dev_id2);
     class_destroy(kxo_class);
     cdev_del(&kxo_cdev);
-    unregister_chrdev_region(dev_id, NR_KMLDRV);
+    unregister_chrdev_region(dev_id, 1);
+    unregister_chrdev_region(dev_id2, 1);
 
     kfifo_free(&rx_fifo);
+    kfifo_free(&rx_fifo2);
     pr_info("kxo: unloaded\n");
 }
 

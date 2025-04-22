@@ -29,6 +29,7 @@ struct task *tasklist[3];
 static bool read_attr, end_attr;
 fd_set readset;
 int device_fd;
+int device_fd2;
 int max_fd;
 
 static char table[N_GRIDS];
@@ -136,7 +137,7 @@ static void task1(void)
         FD_CLR(device_fd, &readset);
 
         read(device_fd, step, 4);
-        printf("\033[H\033[J"); /* ASCII escape code to clear the screen */
+        // printf("\033[H\033[J"); /* ASCII escape code to clear the screen */
         table[step[1] - '0'] = step[0];
         draw_board(table);
 
@@ -153,8 +154,15 @@ static void task1(void)
 }
 static void task2(void)
 {
+    char test[6];
+    test[5] = '\0';
     if (setjmp(tasklist[1]->env) == 0)
         longjmp(schedule_buf, 1);
+    if (read_attr && FD_ISSET(device_fd2, &readset)) {
+        FD_CLR(device_fd2, &readset);
+        read(device_fd2, test, 5);
+        printf("This is :%s\n", test);
+    }
 
     longjmp(schedule_buf, 1);
 }
@@ -191,6 +199,7 @@ static void file_listen(void)
     FD_ZERO(&readset);
     FD_SET(STDIN_FILENO, &readset);
     FD_SET(device_fd, &readset);
+    FD_SET(device_fd2, &readset);
 
     int result = select(max_fd + 1, &readset, NULL, NULL, NULL);
     if (result < 0) {
@@ -245,7 +254,9 @@ int main(int argc, char *argv[])
 
     // fd_set readset;
     device_fd = open(XO_DEVICE_FILE, O_RDONLY);
+    device_fd2 = open("/dev/kxo2", O_RDONLY);
     max_fd = device_fd > STDIN_FILENO ? device_fd : STDIN_FILENO;
+    max_fd = device_fd2 > max_fd ? device_fd2 : max_fd;
     read_attr = true;
     end_attr = false;
 
@@ -258,6 +269,7 @@ int main(int argc, char *argv[])
     fcntl(STDIN_FILENO, F_SETFL, flags);
 
     close(device_fd);
+    close(device_fd2);
 
     return 0;
 }
