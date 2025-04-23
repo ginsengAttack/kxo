@@ -79,7 +79,7 @@ static struct class *kxo_class;
 static struct cdev kxo_cdev, kxo_cdev2;
 
 static char move_step[4];
-
+static char move_step2[4];
 
 /* Data are stored into a kfifo buffer before passing them to the userspace */
 static DECLARE_KFIFO_PTR(rx_fifo, unsigned char);
@@ -106,13 +106,13 @@ static void produce_board(void)
     pr_debug("kxo: %s: in %u/%u bytes\n", __func__, len, kfifo_len(&rx_fifo));
 }
 
-/* Mutex to serialize kfifo writers within the workqueue handler */
-static DEFINE_MUTEX(producer_lock);  // will deleted
+// /* Mutex to serialize kfifo writers within the workqueue handler */
+// static DEFINE_MUTEX(producer_lock);  // will deleted
 
 /* Mutex to serialize fast_buf consumers: we can use a mutex because consumers
  * run in workqueue handler (kernel thread context).
  */
-static DEFINE_MUTEX(consumer_lock);  // will deleted
+// static DEFINE_MUTEX(consumer_lock);  // will deleted
 
 /* We use an additional "faster" circular buffer to quickly store data from
  * interrupt context, before adding them to the kfifo.
@@ -120,6 +120,7 @@ static DEFINE_MUTEX(consumer_lock);  // will deleted
 static struct circ_buf fast_buf;
 
 static char table[N_GRIDS];
+static char table2[N_GRIDS];
 
 /* Clear all data from the circular buffer fast_buf */
 static void fast_buf_clear(void)
@@ -128,23 +129,8 @@ static void fast_buf_clear(void)
 }
 
 /* Workqueue handler: executed by a kernel thread */
-static void drawboard_work_func(struct work_struct *w)
+static void drawboard_work_func(void)
 {
-    int cpu;
-
-    /* This code runs from a kernel thread, so softirqs and hard-irqs must
-     * be enabled.
-     */
-    WARN_ON_ONCE(in_softirq());
-    WARN_ON_ONCE(in_interrupt());
-
-    /* Pretend to simulate access to per-CPU data, disabling preemption
-     * during the pr_info().
-     */
-    cpu = get_cpu();
-    pr_info("kxo: [CPU#%d] %s\n", cpu, __func__);
-    put_cpu();
-
     read_lock(&attr_obj.lock);
     if (attr_obj.display == '0') {
         read_unlock(&attr_obj.lock);
@@ -152,35 +138,28 @@ static void drawboard_work_func(struct work_struct *w)
     }
     read_unlock(&attr_obj.lock);
 
-    // mutex_lock(&producer_lock);
-    // draw_board(table);
-    // mutex_unlock(&producer_lock);
-
-    /* Store data to the kfifo buffer */
-    mutex_lock(&consumer_lock);
     produce_board();
-    mutex_unlock(&consumer_lock);
 
     wake_up_interruptible(&rx_wait);
+}
+static void drawboard_work_func2(void)
+{
+    read_lock(&attr_obj.lock);
+    if (attr_obj.display == '0') {
+        read_unlock(&attr_obj.lock);
+        return;
+    }
+    read_unlock(&attr_obj.lock);
+    unsigned int len = kfifo_in(&rx_fifo2, move_step2, sizeof(move_step2));
+    pr_debug("kxo: %s: in %u/%u bytes\n", __func__, len, kfifo_len(&rx_fifo2));
+    wake_up_interruptible(&rx_wait2);
 }
 
 static char turn;
 static int finish;
 
-static void ai_one_work_func(struct work_struct *w)
+static void ai_one_work_func(void)
 {
-    ktime_t tv_start, tv_end;
-    s64 nsecs;
-
-    int cpu;
-
-    WARN_ON_ONCE(in_softirq());
-    WARN_ON_ONCE(in_interrupt());
-
-    cpu = get_cpu();
-    pr_info("kxo: [CPU#%d] start doing %s\n", cpu, __func__);
-    tv_start = ktime_get();
-    mutex_lock(&producer_lock);
     int move;
     WRITE_ONCE(move, mcts(table, 'O'));
 
@@ -188,42 +167,31 @@ static void ai_one_work_func(struct work_struct *w)
 
     if (move != -1)
         WRITE_ONCE(table[move], 'O');
-    move_step[0] = 'O';
-    smp_wmb();
-    move_step[1] = move + '0';
-    smp_wmb();
-    move_step[2] = 'N';
-    smp_wmb();
-    move_step[3] = '\n';
+
+    char tmp[4] = {'O', move + '0', 'N', '\n'};
+    memcpy(move_step, tmp, sizeof(tmp));
     smp_wmb();
 
     WRITE_ONCE(turn, 'X');
     WRITE_ONCE(finish, 1);
     smp_wmb();
-    mutex_unlock(&producer_lock);
-    tv_end = ktime_get();
+}
+static void ai_one_work_func2(void)
+{
+    int move;
+    WRITE_ONCE(move, mcts(table2, 'O'));
+    smp_mb();
 
-    nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
+    if (move != -1)
+        WRITE_ONCE(table2[move], 'O');
 
-    pr_info("kxo: [CPU#%d] doing %s for %llu usec\n", cpu, __func__,
-            (unsigned long long) nsecs >> 10);
-    put_cpu();
+    char tmp[4] = {'O', move + '0', 'N', '\n'};
+    memcpy(move_step2, tmp, sizeof(tmp));
+    smp_wmb();
 }
 
-static void ai_two_work_func(struct work_struct *w)
+static void ai_two_work_func(void)
 {
-    ktime_t tv_start, tv_end;
-    s64 nsecs;
-
-    int cpu;
-
-    WARN_ON_ONCE(in_softirq());
-    WARN_ON_ONCE(in_interrupt());
-
-    cpu = get_cpu();
-    pr_info("kxo: [CPU#%d] start doing %s\n", cpu, __func__);
-    tv_start = ktime_get();
-    mutex_lock(&producer_lock);
     int move;
     WRITE_ONCE(move, negamax_predict(table, 'X').move);
 
@@ -231,25 +199,27 @@ static void ai_two_work_func(struct work_struct *w)
 
     if (move != -1)
         WRITE_ONCE(table[move], 'X');
-    move_step[0] = 'X';
-    smp_wmb();
-    move_step[1] = move + '0';
-    smp_wmb();
-    move_step[2] = 'N';
-    smp_wmb();
-    move_step[3] = '\n';
+
+    char tmp[4] = {'X', move + '0', 'N', '\n'};
+    memcpy(move_step, tmp, sizeof(tmp));
     smp_wmb();
 
     WRITE_ONCE(turn, 'O');
     WRITE_ONCE(finish, 1);
     smp_wmb();
-    mutex_unlock(&producer_lock);
-    tv_end = ktime_get();
+}
+static void ai_two_work_func2(void)
+{
+    int move;
+    WRITE_ONCE(move, negamax_predict(table2, 'X').move);
+    smp_mb();
 
-    nsecs = (s64) ktime_to_ns(ktime_sub(tv_end, tv_start));
-    pr_info("kxo: [CPU#%d] end doing %s for %llu usec\n", cpu, __func__,
-            (unsigned long long) nsecs >> 10);
-    put_cpu();
+    if (move != -1)
+        WRITE_ONCE(table2[move], 'X');
+
+    char tmp[4] = {'X', move + '0', 'N', '\n'};
+    memcpy(move_step2, tmp, sizeof(tmp));
+    smp_wmb();
 }
 /*use coroutine to package ai_1、ai_2 and drawboard in one work item
  *and tasklet can just put one item into work queue
@@ -257,19 +227,41 @@ static void ai_two_work_func(struct work_struct *w)
 
 static void entire_game_func(struct work_struct *w)
 {
+    int cpu;
+    WARN_ON_ONCE(in_softirq());
+    WARN_ON_ONCE(in_interrupt());
+
+    cpu = get_cpu();
+    pr_info("kxo: [CPU#%d] %s\n", cpu, __func__);
+
     READ_ONCE(finish);
     READ_ONCE(turn);
     smp_rmb();
     if (finish && turn == 'O') {
         WRITE_ONCE(finish, 0);
         smp_wmb();
-        ai_one_work_func(w);
+        ai_one_work_func();
     } else if (finish && turn == 'X') {
         WRITE_ONCE(finish, 0);
         smp_wmb();
-        ai_two_work_func(w);
+        ai_two_work_func();
     }
-    drawboard_work_func(w);
+    drawboard_work_func();
+    put_cpu();
+}
+/*test if game2 worj or not*/
+static void test_game2_func(struct work_struct *w)
+{
+    int cpu;
+    WARN_ON_ONCE(in_softirq());
+    WARN_ON_ONCE(in_interrupt());
+    cpu = get_cpu();
+    pr_info("kxo: [CPU#%d] %s\n", cpu, __func__);
+    ai_one_work_func2();
+    drawboard_work_func2();
+    ai_two_work_func2();
+    drawboard_work_func2();
+    put_cpu();
 }
 /* Workqueue for asynchronous bottom-half processing */
 static struct workqueue_struct *kxo_workqueue;
@@ -281,6 +273,7 @@ static struct workqueue_struct *kxo_workqueue;
 // static DECLARE_WORK(ai_one_work, ai_one_work_func);
 // static DECLARE_WORK(ai_two_work, ai_two_work_func);
 static DECLARE_WORK(entire_game, entire_game_func);
+static DECLARE_WORK(test_game2, test_game2_func);
 
 /* Tasklet handler.
  *
@@ -299,6 +292,7 @@ static void game_tasklet_func(unsigned long __data)
     tv_start = ktime_get();
 
     queue_work(kxo_workqueue, &entire_game);
+    queue_work(kxo_workqueue, &test_game2);
 
     tv_end = ktime_get();
 
@@ -337,35 +331,26 @@ static void timer_handler(struct timer_list *__timer)
     tv_start = ktime_get();
 
     char win = check_win(table);
+    char win2 = check_win(table2);
 
-    if (win == ' ') {
+    if (win == ' ' && win2 == ' ') {
         ai_game();
         mod_timer(&timer, jiffies + msecs_to_jiffies(delay));
-    } else {
+    } else if (win2 == ' ') {
         read_lock(&attr_obj.lock);
         if (attr_obj.display == '1') {
             int cpu = get_cpu();
             pr_info("kxo: [CPU#%d] Drawing final board\n", cpu);
             put_cpu();
 
-            mutex_lock(&producer_lock);
             move_step[2] = 'W';
             smp_wmb();
             move_step[3] = '\n';
             smp_wmb();
-            mutex_unlock(&producer_lock);
 
             /* Store data to the kfifo buffer */
-            mutex_lock(&consumer_lock);
             produce_board();
-            mutex_unlock(&consumer_lock);
-
             wake_up_interruptible(&rx_wait);
-
-            char tmp[5] = "game2";
-            kfifo_in(&rx_fifo2, tmp, sizeof(tmp));
-            pr_info("kxo:!!!!!!!!!!!!!!%s\n", tmp);
-            wake_up_interruptible(&rx_wait2);
         }
 
         if (attr_obj.end == '0') {
@@ -373,10 +358,34 @@ static void timer_handler(struct timer_list *__timer)
                    N_GRIDS); /* Reset the table so the game restart */
             mod_timer(&timer, jiffies + msecs_to_jiffies(delay));
         }
+        read_unlock(&attr_obj.lock);
+        pr_info("kxo: %c win!!!\n", win);
+    } else {
+        read_lock(&attr_obj.lock);
+        if (attr_obj.display == '1') {
+            int cpu = get_cpu();
+            pr_info("kxo: [CPU#%d] Drawing final board\n", cpu);
+            put_cpu();
+
+            move_step2[2] = 'W';
+            smp_wmb();
+            move_step2[3] = '\n';
+            smp_wmb();
+            /* Store data to the kfifo buffer */
+            kfifo_in(&rx_fifo2, move_step2, sizeof(move_step2));
+
+            wake_up_interruptible(&rx_wait2);
+        }
+
+        if (attr_obj.end == '0') {
+            memset(table2, ' ',
+                   N_GRIDS); /* Reset the table so the game restart */
+            mod_timer(&timer, jiffies + msecs_to_jiffies(delay));
+        }
 
         read_unlock(&attr_obj.lock);
 
-        pr_info("kxo: %c win!!!\n", win);
+        pr_info("kxo2: %c win!!!\n", win);
     }
     tv_end = ktime_get();
 
@@ -570,6 +579,7 @@ static int __init kxo_init(void)
     negamax_init();
     mcts_init();
     memset(table, ' ', N_GRIDS);
+    memset(table2, ' ', N_GRIDS);
     turn = 'O';
     finish = 1;
 
