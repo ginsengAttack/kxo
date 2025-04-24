@@ -148,7 +148,8 @@ static void task1(void)
                    N_GRIDS); /* Reset the table so the game restart */
             // read(device_fd, step, 4);
             memset(step, ' ', 4); /* Reset the table so the game restart */
-        }
+        } else
+            printf("\n");
     }
 
     longjmp(schedule_buf, 1);
@@ -165,7 +166,6 @@ static void task2(void)
         FD_CLR(device_fd2, &readset);
 
         read(device_fd2, step, 4);
-        // printf("\033[H\033[J"); /* ASCII escape code to clear the screen */
         table2[step[1] - '0'] = step[0];
         draw_board(table2);
 
@@ -174,9 +174,9 @@ static void task2(void)
             memset(table2, ' ',
                    N_GRIDS);      /* Reset the table so the game restart */
             memset(step, ' ', 4); /* Reset the table so the game restart */
-        }
+        } else
+            printf("\n");
     }
-
     longjmp(schedule_buf, 1);
 }
 static void keyboard(void)

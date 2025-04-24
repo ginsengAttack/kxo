@@ -336,7 +336,7 @@ static void timer_handler(struct timer_list *__timer)
     if (win == ' ' && win2 == ' ') {
         ai_game();
         mod_timer(&timer, jiffies + msecs_to_jiffies(delay));
-    } else if (win2 == ' ') {
+    } else if (win != ' ') {
         read_lock(&attr_obj.lock);
         if (attr_obj.display == '1') {
             int cpu = get_cpu();
@@ -360,18 +360,22 @@ static void timer_handler(struct timer_list *__timer)
         }
         read_unlock(&attr_obj.lock);
         pr_info("kxo: %c win!!!\n", win);
-    } else {
+    }
+    if (win2 != ' ') {
         read_lock(&attr_obj.lock);
         if (attr_obj.display == '1') {
             int cpu = get_cpu();
-            pr_info("kxo: [CPU#%d] Drawing final board\n", cpu);
+            pr_info("kxo2: [CPU#%d] Drawing final board\n", cpu);
             put_cpu();
 
+            move_step2[0] = win2;
+            smp_wmb();
             move_step2[2] = 'W';
             smp_wmb();
             move_step2[3] = '\n';
             smp_wmb();
             /* Store data to the kfifo buffer */
+            pr_info("Test!!!!!%cbut%c\n", win2, move_step2[0]);
             kfifo_in(&rx_fifo2, move_step2, sizeof(move_step2));
 
             wake_up_interruptible(&rx_wait2);
@@ -385,7 +389,7 @@ static void timer_handler(struct timer_list *__timer)
 
         read_unlock(&attr_obj.lock);
 
-        pr_info("kxo2: %c win!!!\n", win);
+        pr_info("kxo2: %c win!!!\n", win2);
     }
     tv_end = ktime_get();
 
